@@ -1,0 +1,6 @@
+go 1.22
+
+use (
+	.
+	../../文档/deepseek-harness/default-workspace/go-day5/src
+)

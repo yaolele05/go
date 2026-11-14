@@ -1,0 +1,4 @@
+# 屏蔽 Go 模块缓存与构建产物
+/pkg/mod/
+/go/pkg/mod/
+bin/

@@ -25,9 +25,9 @@ type ExampleReply struct {
 type TaskType int
 
 const (
+	// 长轮询之后不再需要 WaitTask：没活时 GetTask 会挂起而不是立刻返回。
 	MapTask    TaskType = iota // 去跑一个 map 任务
 	ReduceTask                 // 去跑一个 reduce 任务
-	WaitTask                   // 暂时没活，过一会儿再来
 	ExitTask                   // 整个 job 做完了，可以退出
 )
 

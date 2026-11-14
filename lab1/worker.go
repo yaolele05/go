@@ -8,7 +8,7 @@ import "log"
 import "net/rpc"
 import "os"
 import "sort"
-import "time"
+import "sync"
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -51,9 +51,6 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 		switch reply.Type {
 		case ExitTask:
 			return
-		case WaitTask:
-			// 现在没活，但还有别的 worker 在跑。睡一小会儿再来，别忙等。
-			time.Sleep(50 * time.Millisecond)
 		case MapTask:
 			doMap(reply, mapf)
 			reportTask(MapTask, reply.TaskID)
@@ -201,20 +198,52 @@ func CallExample() {
 	}
 }
 
+var (
+	clientMu sync.Mutex
+	client   *rpc.Client
+)
+
+// getClient 懒加载并复用唯一一条到 coordinator 的连接。
+// net/rpc 的 Client 并发安全，内部用序号把多个调用复用到同一条连接上；
+// 复用的另一个好处是 gob 只需在首次传输类型描述。
+func getClient() (*rpc.Client, error) {
+	clientMu.Lock()
+	defer clientMu.Unlock()
+	if client != nil {
+		return client, nil
+	}
+	c, err := rpc.DialHTTP("unix", coordSockName)
+	if err != nil {
+		return nil, err
+	}
+	client = c
+	return c, nil
+}
+
+// dropClient 只在连接真的坏了时调用：关掉并清空缓存，下次调用会重新拨号。
+func dropClient(c *rpc.Client) {
+	clientMu.Lock()
+	defer clientMu.Unlock()
+	if client == c {
+		client = nil
+	}
+	c.Close()
+}
+
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	c, err := rpc.DialHTTP("unix", coordSockName)
+	c, err := getClient()
 	if err != nil {
-		log.Fatal("dialing:", err)
+		log.Printf("%d: dialing: %v", os.Getpid(), err)
+		return false
 	}
-	defer c.Close()
 
-	if err := c.Call(rpcname, args, reply); err == nil {
-		return true
+	if err := c.Call(rpcname, args, reply); err != nil {
+		log.Printf("%d: call %s failed err %v", os.Getpid(), rpcname, err)
+		dropClient(c)
+		return false
 	}
-	log.Printf("%d: call failed err %v", os.Getpid(), err)
-	return false
+	return true
 }

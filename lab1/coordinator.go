@@ -37,7 +37,8 @@ const (
 const taskTimeout = 10 * time.Second
 
 type Coordinator struct {
-	mu sync.Mutex // 保护下面所有字段：RPC handler 是并发调用的
+	mu   sync.Mutex // 保护下面所有字段：RPC handler 是并发调用的
+	cond *sync.Cond // 任务状态变化时唤醒所有在 GetTask 里等活的 worker
 
 	files   []string
 	nMap    int
@@ -64,14 +65,18 @@ func pickIdleLocked(tasks []TaskInfo) int {
 }
 
 // expireStaleLocked 把超时未汇报的任务打回 Idle，这样它会被重新派发。
+// 返回是否真的收回了任务（调用者据此决定要不要唤醒等活的 worker）。
 // 调用者必须持有 c.mu。
-func expireStaleLocked(tasks []TaskInfo) {
+func expireStaleLocked(tasks []TaskInfo) bool {
 	now := time.Now()
+	changed := false
 	for i := range tasks {
 		if tasks[i].state == InProgress && now.Sub(tasks[i].start) > taskTimeout {
 			tasks[i].state = Idle
+			changed = true
 		}
 	}
+	return changed
 }
 
 // anyInProgressLocked 还有没有正在跑的任务。
@@ -94,50 +99,65 @@ func allFinishedLocked(tasks []TaskInfo) bool {
 	return true
 }
 
-// GetTask 是 worker 领活的入口：有活就派，没活让它等，全干完让它退出。
-func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+// assignLocked 尝试给一次 GetTask 一个最终答复。
+//
+// 返回 true 表示 reply 已经填好（干活或退出），可以直接返回给 worker；
+// 返回 false 表示当前确实没活，调用者应该继续等状态变化。
+// 调用者必须持有 c.mu。
+func (c *Coordinator) assignLocked(reply *GetTaskReply) bool {
 	// 先把超时的任务回收，这样下面的 pickIdle 就能重新派出去。
 	expireStaleLocked(c.mapTasks)
 	expireStaleLocked(c.reduceTasks)
 
-	if c.phase == phaseMap {
-		if i := pickIdleLocked(c.mapTasks); i >= 0 {
-			reply.Type = MapTask
-			reply.TaskID = i
-			reply.File = c.files[i]
-			reply.NReduce = c.nReduce
-			return nil
+	for {
+		switch c.phase {
+		case phaseMap:
+			if i := pickIdleLocked(c.mapTasks); i >= 0 {
+				reply.Type = MapTask
+				reply.TaskID = i
+				reply.File = c.files[i]
+				reply.NReduce = c.nReduce
+				return true
+			}
+			if anyInProgressLocked(c.mapTasks) {
+				return false
+			}
+			// 没有空闲、也没有在跑的 map 任务 => map 阶段结束，进入 reduce。
+			// switch 结束后 for 会再进来一次，走 phaseReduce 分支。
+			c.phase = phaseReduce
+		case phaseReduce:
+			if i := pickIdleLocked(c.reduceTasks); i >= 0 {
+				reply.Type = ReduceTask
+				reply.TaskID = i
+				reply.ReduceIdx = i
+				reply.NMap = c.nMap
+				return true
+			}
+			if anyInProgressLocked(c.reduceTasks) {
+				return false
+			}
+			c.phase = phaseDone
+			c.done = true
+			reply.Type = ExitTask
+			return true
+		default: // phaseDone
+			reply.Type = ExitTask
+			return true
 		}
-		if anyInProgressLocked(c.mapTasks) {
-			reply.Type = WaitTask
-			return nil
-		}
-		// 没有空闲、也没有在跑的 map 任务 => map 阶段结束，进入 reduce。
-		c.phase = phaseReduce
 	}
+}
 
-	if c.phase == phaseReduce {
-		if i := pickIdleLocked(c.reduceTasks); i >= 0 {
-			reply.Type = ReduceTask
-			reply.TaskID = i
-			reply.ReduceIdx = i
-			reply.NMap = c.nMap
-			return nil
-		}
-		if anyInProgressLocked(c.reduceTasks) {
-			reply.Type = WaitTask
-			return nil
-		}
-		c.phase = phaseDone
-		c.done = true
-		reply.Type = ExitTask
-		return nil
+// GetTask 是 worker 领活的入口，采用长轮询：有活立刻派，没活就把这个
+// RPC 挂起，直到 ReportTask 或后台超时回收改变了状态再醒过来。
+func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Wait 会原子地释放 c.mu 并阻塞；被唤醒后重新加锁。
+	// 用 for 而不是 if 是条件变量的标准写法：醒来后必须重新检查条件。
+	for !c.assignLocked(reply) {
+		c.cond.Wait()
 	}
-
-	reply.Type = ExitTask
 	return nil
 }
 
@@ -147,6 +167,7 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	changed := false
 	switch args.Type {
 	case MapTask:
 		if args.TaskID < 0 || args.TaskID >= len(c.mapTasks) {
@@ -154,9 +175,11 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 		}
 		if c.mapTasks[args.TaskID].state != Finished {
 			c.mapTasks[args.TaskID].state = Finished
+			changed = true
 		}
 		if c.phase == phaseMap && allFinishedLocked(c.mapTasks) {
 			c.phase = phaseReduce
+			changed = true
 		}
 	case ReduceTask:
 		if args.TaskID < 0 || args.TaskID >= len(c.reduceTasks) {
@@ -164,11 +187,17 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 		}
 		if c.reduceTasks[args.TaskID].state != Finished {
 			c.reduceTasks[args.TaskID].state = Finished
+			changed = true
 		}
 		if c.phase == phaseReduce && allFinishedLocked(c.reduceTasks) {
 			c.phase = phaseDone
 			c.done = true
+			changed = true
 		}
+	}
+	// 状态可能变得"有活可派"或"该退出了"，叫醒所有挂起的 GetTask。
+	if changed {
+		c.cond.Broadcast()
 	}
 	return nil
 }
@@ -193,6 +222,26 @@ func (c *Coordinator) server(sockname string) {
 	go http.Serve(l, nil)
 }
 
+// expireLoop 定期回收超时未汇报的任务。长轮询之后没有 worker 会定时来
+// "问"了，所以超时回收必须由后台 goroutine 主动推进并唤醒等活的 worker。
+func (c *Coordinator) expireLoop() {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for range t.C {
+		c.mu.Lock()
+		if c.done {
+			c.mu.Unlock()
+			return
+		}
+		changed := expireStaleLocked(c.mapTasks)
+		changed = expireStaleLocked(c.reduceTasks) || changed
+		if changed {
+			c.cond.Broadcast()
+		}
+		c.mu.Unlock()
+	}
+}
+
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
@@ -213,7 +262,10 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 	}
 	c.mapTasks = make([]TaskInfo, len(files))
 	c.reduceTasks = make([]TaskInfo, nReduce)
+	c.cond = sync.NewCond(&c.mu)
 
+	// cond 必须在开始接 RPC 之前初始化，否则 handler 里会空指针。
 	c.server(sockname)
+	go c.expireLoop()
 	return &c
 }
