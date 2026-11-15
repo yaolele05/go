@@ -37,6 +37,7 @@ func MakeKVServer() *KVServer {
 
 // Get returns the value and version for args.Key, if args.Key
 // exists. Otherwise, Get returns ErrNoKey.
+// Get 返回 args.Key 对应的值和版本号；如果键不存在，则返回 ErrNoKey。
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -57,6 +58,9 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 // the key on the server. If versions don't match, return ErrVersion.
 // If the key doesn't exist, Put installs the value if the
 // args.Version is 0, and returns ErrNoKey otherwise.
+// 仅当 args.Version 与服务器上该键的版本号一致时，Put 才更新键值；
+// 如果版本号不匹配，则返回 ErrVersion。键不存在时，只有 args.Version 为 0
+// 才会创建该键；否则返回 ErrNoKey。
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -89,6 +93,7 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 }
 
 // You can ignore all arguments; they are for replicated KVservers
+// 这些参数供复制型 KV 服务器使用；本实验可以忽略。
 func StartKVServer(tc *tester.TesterClnt, ends []*labrpc.ClientEnd, gid tester.Tgid, srv int, persister *tester.Persister) []any {
 	kv := MakeKVServer()
 	return []any{kv}

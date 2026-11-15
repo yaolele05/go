@@ -1,0 +1,8 @@
+main/
+mrapps/*.so
+src/main/mrcoordinator
+src/main/mrworker
+src/main/mrsequential
+src/mrapps/*.so
+src/mr/mr-out-*
+src/mr/mr-*.txt
