@@ -8,10 +8,15 @@ package raft
 
 import (
 	"sync"
+	"time"
 
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1 "
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type role int
@@ -290,6 +295,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 func (rf *Raft) Kill() {
 	// TODO(3A): mark this peer stopped so its background goroutines can exit.
 	// TODO(3A)：标记该节点已停止，以便其后台协程退出。
+	atomic.StoreInt32(&rf.dead,1)
 	rf.killed = true
 }
 
@@ -381,7 +387,11 @@ func(rf* Raft) startElection()
             }
             rf.mu.Lock()
             defer rf.mu.Unlock()///////rf.mu??????
+
+
 			rf.resetElectionTimer()///这里需要吗？？？？
+
+
 			if reply.Term > rf.currentTerm {
                 rf.currentTerm = reply.Term
                 rf.votedFor = -1
@@ -400,7 +410,82 @@ func(rf* Raft) startElection()
 		}(peer)
      }
 			
-    //  for循环开始   ？？？？！！！
+    for range rf.peers{
+		// 跳过自己；其余节点各发来一个结果。
+        // 这里的接收次数在下面用收到的回复计数控制。
+		break
+	}
 
-	
+	replies :=0
+
+	for replies <len (rf.peers)-1//为什么是减1
+	{
+
+		reply := <-voteCh///voteCh是一个channel，里面存放的是每个节点的投票结果
+		//if reply{
+			//votes++
+		//}
+		replies++
+		rf.mu.Lock()
+
+		if reply.Term>rf.currentTerm{
+				rf.currentTerm=reply.Term
+				rf.vptedFor=-1
+				rf.state=follower
+				rf.persist()//persister是什么？？？？？
+				rf.mu.Unlock()
+				return
+		}
+
+		if rf.state !=candidate ||rf.currentTerm !=term{
+			rf.mu.Unlock()
+			return
+		}
+
+		if reply.VoteGranted{
+			votes++
+			if votes>len(rf.peers)/2{//超过半数，成为leader
+				rf.state=leader
+				// TODO(3B): initialize leader state (nextIndex, matchIndex).
+				// TODO(3B)：初始化领导者状态（nextIndex、matchIndex）。
+				rf.mu.Unlock()
+				go rf.heartbeatLoop()//成为leader后，启动心跳协程
+				return
+			}
+		}
+
+		rf.mu.Unlock()
+	}
+}
+
+func(rf *Raft) electionLoop()
+{
+	for atomic.LoadInt32(&rf.dead){
+		timeout :=time.Duration(300+rand.Intn(200))*time.Millisecond
+		timer :=time.NewTimer(timeout)
+
+		select{
+		case<- rf.heartBeatch:
+		 // 收到有效心跳或获准的投票，丢弃本轮计时器；
+            // 下一轮重新抽取超时并开始计时。
+
+			if !timer.Stop()
+			{
+				<-timer.C
+			}
+		case <-timer.C:
+			rf.mu.Lock()
+			shouldStart :=rf.state !=leader
+			rf.mu.Unlock()
+
+			if shouldStart{
+				rf.startElection()
+
+			}
+		}
+	}
+}
+func(rf *Raft) Killed(){
+
+	atomic.StoreInt32(&rf.dead,1)
 }
